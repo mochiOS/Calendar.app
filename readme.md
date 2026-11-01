@@ -6,6 +6,14 @@ states. Event editing uses the shared Dialog, TextField, Checkbox and TextEditor
 The app icon is extracted from the user's existing Desktop mock SVG; existing
 system icons and Dock styling are unchanged.
 
+The toolbar uses ViewKit's `Toolbar` and `ActionToolbar`, including native
+overflow at narrow widths. The month grid remains calendar-specific drawing;
+its background, continuous pane corners, clipping and input exclusion use
+`Surface`. Selected days share the standard active/inactive selection tokens.
+The agenda uses native `ListRow` and `Scroll` with a retained scroll state.
+Only visible agenda rows are painted and receive input; row height and spacing
+come from shared tokens. Changing the selected date resets the agenda position.
+
 - Click a day to see its events; click an event to edit it.
 - New Event (Ctrl/Super+N) creates a draft for the selected day.
 - Previous/next month, Today, arrow keys, Page Up/Down and Home navigate dates.
@@ -43,9 +51,11 @@ Notifications are intentionally left for the later notification integration.
 right-hand desktop clock uses Binder's existing activation queue to open or
 activate Calendar. `mmake preview-calendar` launches it independently on Linux;
 `mmake calendar` builds the native binary, and rootfs staging packages Calendar.app
-and its capability manifest. Sources currently belong to the root repository;
-no remote Calendar repository is assumed.
+and its capability manifest. Sources are managed in Calendar.app's dedicated
+repository; the root workspace records its repository reference.
 
 Tests cover civil-date arithmetic, leap centuries and month grids, parsing,
 storage round trips and corruption, concurrent-window conflicts, recovery, failed
-saves, and native control flows for create/edit/confirmed deletion.
+saves, and native control flows for create/edit/confirmed deletion. UI tests
+also cover wide/stacked layouts in both themes, the month pane's corner backdrop,
+active/inactive day selection, and bounded agenda drawing with 1,000 events.

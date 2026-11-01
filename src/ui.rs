@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Action {
     Previous,
     Next,
@@ -29,16 +29,14 @@ struct Model {
     today: Date,
     store: Option<Store>,
     error: Option<String>,
-    agenda_scroll: f32,
     last_clock: Instant,
 }
 struct Core {
     model: RefCell<Model>,
     action: Rc<Cell<Option<Action>>>,
-    previous: Button,
-    next: Button,
-    today: Button,
-    add: Button,
+    toolbar: ActionToolbarState<Action>,
+    buttons: RefCell<BTreeMap<Action, ButtonInteractionState>>,
+    agenda_scroll: ScrollState,
     days: RefCell<BTreeMap<Date, ButtonInteractionState>>,
     rows: RefCell<BTreeMap<u64, ButtonInteractionState>>,
     editor: RefCell<Option<Editor>>,
@@ -70,16 +68,6 @@ impl CalendarView {
             Err(error) => (None, Some(error)),
         };
         let action = Rc::new(Cell::new(None));
-        let previous = button("Previous month", Action::Previous, &action)
-            .content(Icon::new(SymbolName::ChevronLeft))
-            .style(ButtonStyle::Ghost);
-        let next = button("Next month", Action::Next, &action)
-            .content(Icon::new(SymbolName::ChevronRight))
-            .style(ButtonStyle::Ghost);
-        let today_button = button("Today", Action::Today, &action);
-        let add = button("New Event", Action::New, &action)
-            .style(ButtonStyle::Accent)
-            .enabled(store.is_some());
         Self {
             core: Rc::new(Core {
                 model: RefCell::new(Model {
@@ -88,14 +76,12 @@ impl CalendarView {
                     today,
                     store,
                     error,
-                    agenda_scroll: 0.0,
                     last_clock: Instant::now(),
                 }),
                 action,
-                previous,
-                next,
-                today: today_button,
-                add,
+                toolbar: ActionToolbarState::new(),
+                buttons: RefCell::new(BTreeMap::new()),
+                agenda_scroll: ScrollState::new(),
                 days: RefCell::new(BTreeMap::new()),
                 rows: RefCell::new(BTreeMap::new()),
                 editor: RefCell::new(None),
@@ -138,7 +124,7 @@ impl CalendarView {
             ))
             .on_click(move || action.set(Some(Action::Select(date))))
     }
-    fn row_button(&self, event: &Event) -> Button {
+    fn row_button(&self, event: &Event, index: usize, count: usize) -> ListRow {
         let interaction = self
             .core
             .rows
@@ -148,11 +134,100 @@ impl CalendarView {
             .clone();
         let action = self.core.action.clone();
         let id = event.id;
-        Button::with_interaction_and_label(interaction, "")
-            .style(ButtonStyle::Ghost)
-            .content(EventRow(event.clone()))
-            .accessibility_label(format!("{}, {}", event_time(event), event.title))
-            .on_click(move || action.set(Some(Action::Edit(id))))
+        let detail = if event.location.is_empty() {
+            event_time(event)
+        } else {
+            format!("{} · {}", event_time(event), event.location)
+        };
+        ListRow::with_interaction(interaction, &event.title)
+            .subtitle(detail)
+            .adjacent_rows(index > 0, index + 1 < count)
+            .on_select(move || action.set(Some(Action::Edit(id))))
+    }
+    fn toolbar(&self) -> ActionToolbar<Action> {
+        let model = self.core.model.borrow();
+        let make = |label: &str, action: Action| {
+            let interaction = self
+                .core
+                .buttons
+                .borrow_mut()
+                .entry(action)
+                .or_default()
+                .clone();
+            let pending = self.core.action.clone();
+            Button::with_interaction_and_label(interaction, label)
+                .on_click(move || pending.set(Some(action)))
+        };
+        ActionToolbar::new(self.core.toolbar.clone())
+            .title(model.month.month_title())
+            .leading(
+                Action::Previous,
+                make("", Action::Previous)
+                    .leading_symbol(SymbolName::ChevronLeft)
+                    .accessibility_label("Previous month"),
+            )
+            .leading(
+                Action::Next,
+                make("", Action::Next)
+                    .leading_symbol(SymbolName::ChevronRight)
+                    .accessibility_label("Next month"),
+            )
+            .trailing(Action::Today, make("Today", Action::Today))
+            .trailing(
+                Action::New,
+                make("New Event", Action::New)
+                    .leading_symbol(SymbolName::Plus)
+                    .style(ButtonStyle::Primary)
+                    .enabled(model.store.is_some()),
+            )
+    }
+    fn agenda(&self, theme: &Theme) -> VStack {
+        let model = self.core.model.borrow();
+        let count = model
+            .store
+            .as_ref()
+            .map(|store| store.on_date(model.selected).len())
+            .unwrap_or(0);
+        let title = format!(
+            "{}, {} {}",
+            WEEKDAYS[model.selected.weekday()],
+            crate::date::MONTHS[model.selected.month as usize - 1],
+            model.selected.day
+        );
+        let subtitle = model.error.clone().unwrap_or_else(|| {
+            if count == 0 {
+                "No events. Add one with New Event.".into()
+            } else if count == 1 {
+                "1 event".into()
+            } else {
+                format!("{count} events")
+            }
+        });
+        VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::None)
+            .child(
+                Padding::all(theme.spacing.large)
+                    .content(
+                        VStack::new()
+                            .alignment(StackAlignment::Stretch)
+                            .gap(StackGap::Small)
+                            .child(Text::styled(title, TextRole::TitleSmall))
+                            .child(Text::caption(subtitle).color(if model.error.is_some() {
+                                theme.colors.destructive
+                            } else {
+                                theme.colors.text_secondary
+                            })),
+                    )
+                    .layout()
+                    .flex_shrink(0.0),
+            )
+            .child(
+                AgendaViewport(self.clone())
+                    .layout()
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0),
+            )
     }
     fn apply_action(&self) {
         let Some(action) = self.core.action.take() else {
@@ -180,7 +255,7 @@ impl CalendarView {
                             .min(Date::days_in_month(month.year, month.month)),
                     )
                     .unwrap();
-                    model.agenda_scroll = 0.0;
+                    self.core.agenda_scroll.reset();
                     self.core.days.borrow_mut().clear();
                     self.core.rows.borrow_mut().clear();
                 }
@@ -194,7 +269,7 @@ impl CalendarView {
                 };
                 model.selected = date;
                 model.month = Date { day: 1, ..date };
-                model.agenda_scroll = 0.0;
+                self.core.agenda_scroll.reset();
                 let grid = model.month.month_grid();
                 self.core
                     .days
@@ -267,7 +342,7 @@ impl CalendarView {
                     };
                 }
                 model.error = None;
-                model.agenda_scroll = 0.0;
+                self.core.agenda_scroll.reset();
                 drop(model);
                 drop(editor_slot);
                 self.core.editor.borrow_mut().take();
@@ -331,48 +406,14 @@ impl Frames {
             (height - 2.0).max(0.0),
         )
     }
-    fn toolbar_button(&self, index: usize) -> Rect {
-        let y = self.toolbar.origin.y + (self.toolbar.size.height - 28.0) / 2.0;
-        match index {
-            0 => Rect::new(self.toolbar.origin.x + 12.0, y, 28.0, 28.0),
-            1 => Rect::new(self.toolbar.origin.x + 44.0, y, 28.0, 28.0),
-            2 => Rect::new(
-                self.toolbar.origin.x + self.toolbar.size.width - 196.0,
-                y,
-                68.0,
-                28.0,
-            ),
-            _ => Rect::new(
-                self.toolbar.origin.x + self.toolbar.size.width - 116.0,
-                y,
-                100.0,
-                28.0,
-            ),
-        }
-    }
-    fn agenda_body(&self) -> Rect {
-        Rect::new(
-            self.agenda.origin.x + 12.0,
-            self.agenda.origin.y + 76.0,
-            (self.agenda.size.width - 24.0).max(0.0),
-            (self.agenda.size.height - 88.0).max(0.0),
-        )
-    }
-    fn event_row(&self, index: usize, scroll: f32) -> Rect {
-        let body = self.agenda_body();
-        Rect::new(
-            body.origin.x,
-            body.origin.y + index as f32 * 72.0 - scroll,
-            body.size.width,
-            68.0,
-        )
-    }
 }
+
 impl View for CalendarView {
     fn measure(&self, constraints: Constraints, _: &mut MeasureContext<'_>) -> Size {
         constraints.constrain(constraints.maximum)
     }
     fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        let toolbar = self.toolbar();
         let mut model = self.core.model.borrow_mut();
         if model.last_clock.elapsed() >= Duration::from_secs(60) {
             if let Some(today) = Date::today() {
@@ -382,126 +423,47 @@ impl View for CalendarView {
         }
         context.request_redraw_at(model.last_clock + Duration::from_secs(60));
         let frames = Frames::new(bounds, context.theme);
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.background))
-            .paint(bounds, context);
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
-            .paint(frames.toolbar, context);
-        for (index, button) in [
-            &self.core.previous,
-            &self.core.next,
-            &self.core.today,
-            &self.core.add,
-        ]
-        .iter()
-        .enumerate()
-        {
-            button.paint(frames.toolbar_button(index), context);
-        }
-        Text::styled(model.month.month_title(), TextRole::TitleSmall).paint(
-            Rect::new(
-                frames.toolbar.origin.x + 88.0,
-                frames.toolbar.origin.y + (frames.toolbar.size.height - 24.0) / 2.0,
-                (frames.toolbar.size.width - 296.0).max(0.0),
-                24.0,
-            ),
-            context,
-        );
-        for (index, weekday) in WEEKDAYS.iter().enumerate() {
-            let cell = frames.grid_cell(index);
-            Text::caption(*weekday)
-                .color(context.theme.colors.text_secondary)
-                .paint(
-                    Rect::new(
-                        cell.origin.x + 8.0,
-                        frames.month.origin.y + 8.0,
-                        cell.size.width,
-                        20.0,
-                    ),
-                    context,
-                );
-        }
-        for (index, date) in model.month.month_grid().iter().enumerate() {
-            if let Some(date) = date {
-                self.day_button(
-                    *date,
-                    model.month.month,
-                    model.selected,
-                    model.today,
-                    model
-                        .store
-                        .as_ref()
-                        .map(|store| store.on_date(*date))
-                        .unwrap_or(&[]),
-                )
-                .paint(frames.grid_cell(index), context);
-            }
-        }
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
-            .paint(frames.agenda, context);
-        let date_header = format!(
-            "{}, {} {}",
-            WEEKDAYS[model.selected.weekday()],
-            crate::date::MONTHS[model.selected.month as usize - 1],
-            model.selected.day
-        );
-        Text::styled(date_header, TextRole::TitleSmall).paint(
-            Rect::new(
-                frames.agenda.origin.x + 20.0,
-                frames.agenda.origin.y + 18.0,
-                (frames.agenda.size.width - 40.0).max(0.0),
-                26.0,
-            ),
-            context,
-        );
-        let selected = model
-            .store
-            .as_ref()
-            .map(|store| store.on_date(model.selected))
-            .unwrap_or(&[]);
-        let subtitle = model.error.clone().unwrap_or_else(|| {
-            if selected.is_empty() {
-                "No events. Add one with New Event.".into()
-            } else {
-                format!("{} events", selected.len())
-            }
-        });
-        Text::caption(subtitle)
-            .color(if model.error.is_some() {
-                context.theme.colors.destructive
-            } else {
-                context.theme.colors.text_secondary
-            })
-            .paint(
-                Rect::new(
-                    frames.agenda.origin.x + 20.0,
-                    frames.agenda.origin.y + 48.0,
-                    (frames.agenda.size.width - 40.0).max(0.0),
-                    22.0,
-                ),
-                context,
-            );
-        let body = frames.agenda_body();
-        context
-            .display_list
-            .push(DrawCommand::PushClip { rect: body });
-        for (index, event) in selected
-            .iter()
-            .enumerate()
-            .skip((model.agenda_scroll / 72.0).floor() as usize)
-            .take((body.size.height / 72.0).ceil() as usize + 1)
-        {
-            let row = frames.event_row(index, model.agenda_scroll);
-            if row.origin.y + row.size.height > body.origin.y
-                && row.origin.y < body.origin.y + body.size.height
-            {
-                self.row_button(event).paint(row, context);
-            }
-        }
-        context.display_list.push(DrawCommand::PopClip);
+        Surface::app().paint(bounds, context);
+        Toolbar::new(toolbar).paint(frames.toolbar, context);
+        Surface::sidebar().paint(frames.month, context);
+        Surface::pane()
+            .in_container(bounds)
+            .paint_content(frames.month, context, |context| {
+                for (index, weekday) in WEEKDAYS.iter().enumerate() {
+                    let cell = frames.grid_cell(index);
+                    Text::caption(*weekday)
+                        .color(context.theme.colors.text_secondary)
+                        .paint(
+                            Rect::new(
+                                cell.origin.x + 8.0,
+                                frames.month.origin.y + 8.0,
+                                cell.size.width,
+                                20.0,
+                            ),
+                            context,
+                        );
+                }
+                for (index, date) in model.month.month_grid().iter().enumerate() {
+                    if let Some(date) = date {
+                        self.day_button(
+                            *date,
+                            model.month.month,
+                            model.selected,
+                            model.today,
+                            model
+                                .store
+                                .as_ref()
+                                .map(|store| store.on_date(*date))
+                                .unwrap_or(&[]),
+                        )
+                        .paint(frames.grid_cell(index), context);
+                    }
+                }
+            });
         drop(model);
+        Surface::sidebar()
+            .content(self.agenda(context.theme))
+            .paint(frames.agenda, context);
         if let Some(editor) = self.core.editor.borrow().as_ref() {
             editor.paint(bounds, context);
         }
@@ -534,77 +496,46 @@ impl View for CalendarView {
             return EventResult::Consumed;
         }
         let frames = Frames::new(bounds, context.theme());
-        let mut result = EventResult::Ignored;
-        for (index, button) in [
-            &self.core.previous,
-            &self.core.next,
-            &self.core.today,
-            &self.core.add,
-        ]
-        .iter()
-        .enumerate()
-        {
-            result =
-                result.merge(button.handle_event(frames.toolbar_button(index), event, context));
-        }
+        let mut result = Toolbar::new(self.toolbar()).handle_event(frames.toolbar, event, context);
         let model = self.core.model.borrow();
-        for (index, date) in model.month.month_grid().iter().enumerate() {
-            if let Some(date) = date {
-                result = result.merge(
-                    self.day_button(
-                        *date,
-                        model.month.month,
-                        model.selected,
-                        model.today,
-                        model
-                            .store
-                            .as_ref()
-                            .map(|store| store.on_date(*date))
-                            .unwrap_or(&[]),
-                    )
-                    .handle_event(frames.grid_cell(index), event, context),
-                );
-            }
-        }
-        let selected = model
-            .store
-            .as_ref()
-            .map(|store| store.on_date(model.selected))
-            .unwrap_or(&[]);
-        let body = frames.agenda_body();
-        for (index, event_row) in selected
-            .iter()
-            .enumerate()
-            .skip((model.agenda_scroll / 72.0).floor() as usize)
-            .take((body.size.height / 72.0).ceil() as usize + 1)
-        {
-            let row = frames.event_row(index, model.agenda_scroll);
-            if row.origin.y + row.size.height > body.origin.y
-                && row.origin.y < body.origin.y + body.size.height
-            {
-                let outside = ViewEvent::PointerLeft;
-                let row_event = if event.position().is_some_and(|p| !body.contains(p)) {
-                    &outside
-                } else {
-                    event
-                };
-                result = result.merge(
-                    self.row_button(event_row)
-                        .handle_event(row, row_event, context),
-                );
-            }
-        }
-        let maximum = (selected.len() as f32 * 72.0 - body.size.height).max(0.0);
+        result = result.merge(Surface::pane().in_container(bounds).handle_content_event(
+            frames.month,
+            event,
+            context,
+            |event, context| {
+                let mut result = EventResult::Ignored;
+                for (index, date) in model.month.month_grid().iter().enumerate() {
+                    if let Some(date) = date {
+                        result = result.merge(
+                            self.day_button(
+                                *date,
+                                model.month.month,
+                                model.selected,
+                                model.today,
+                                model
+                                    .store
+                                    .as_ref()
+                                    .map(|store| store.on_date(*date))
+                                    .unwrap_or(&[]),
+                            )
+                            .handle_event(
+                                frames.grid_cell(index),
+                                event,
+                                context,
+                            ),
+                        );
+                    }
+                }
+                result
+            },
+        ));
         drop(model);
+        result = result.merge(
+            Surface::sidebar()
+                .content(self.agenda(context.theme()))
+                .handle_event(frames.agenda, event, context),
+        );
         match event {
-            ViewEvent::Scroll {
-                position, delta_y, ..
-            } if body.contains(*position) => {
-                let mut model = self.core.model.borrow_mut();
-                model.agenda_scroll = (model.agenda_scroll - *delta_y * 36.0).clamp(0.0, maximum);
-                context.request_redraw_in(frames.agenda);
-                result = EventResult::Consumed;
-            }
             ViewEvent::KeyPressed { key, modifiers } => {
                 let model = self.core.model.borrow();
                 let selected = match key {
@@ -656,10 +587,20 @@ impl View for DayCell {
         if self.selected {
             Rectangle::new()
                 .radius(CornerRadius::Small)
-                .color(RectangleColor::Custom(context.theme.colors.accent_soft))
+                .color(RectangleColor::Custom(if context.window_active() {
+                    context.theme.list.selected_background
+                } else {
+                    context.theme.list.inactive_selected_background
+                }))
                 .paint(bounds, context);
         }
-        let color = if self.today {
+        let color = if self.selected {
+            if context.window_active() {
+                context.theme.list.selected_foreground
+            } else {
+                context.theme.list.inactive_selected_foreground
+            }
+        } else if self.today {
             context.theme.colors.accent
         } else if self.outside {
             context.theme.colors.text_tertiary
@@ -722,45 +663,114 @@ fn event_time(event: &Event) -> String {
         .map(|(a, b)| format!("{} – {}", time_label(a), time_label(b)))
         .unwrap_or_else(|| "All day".into())
 }
-struct EventRow(Event);
-impl View for EventRow {
+struct AgendaViewport(CalendarView);
+impl View for AgendaViewport {
     fn measure(&self, c: Constraints, _: &mut MeasureContext<'_>) -> Size {
-        c.constrain(Size::new(c.maximum.width, 60.0))
+        c.constrain(c.maximum)
     }
-    fn paint(&self, b: Rect, c: &mut PaintContext<'_>) {
-        Text::caption(event_time(&self.0))
-            .color(c.theme.colors.accent)
-            .paint(
-                Rect::new(
-                    b.origin.x + 4.0,
-                    b.origin.y + 1.0,
-                    (b.size.width - 8.0).max(0.0),
-                    18.0,
-                ),
-                c,
-            );
-        Text::label(self.0.title.clone()).weight(600).paint(
-            Rect::new(
-                b.origin.x + 4.0,
-                b.origin.y + 21.0,
-                (b.size.width - 8.0).max(0.0),
-                20.0,
-            ),
-            c,
-        );
-        if !self.0.location.is_empty() {
-            Text::caption(self.0.location.clone())
-                .color(c.theme.colors.text_secondary)
-                .paint(
-                    Rect::new(
-                        b.origin.x + 4.0,
-                        b.origin.y + 43.0,
-                        (b.size.width - 8.0).max(0.0),
-                        18.0,
-                    ),
-                    c,
-                );
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        Scroll::new(self.0.core.agenda_scroll.clone())
+            .axis(ScrollAxis::Vertical)
+            .content(AgendaRows {
+                view: self.0.clone(),
+                viewport: bounds,
+            })
+            .paint(bounds, context);
+    }
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        Scroll::new(self.0.core.agenda_scroll.clone())
+            .axis(ScrollAxis::Vertical)
+            .content(AgendaRows {
+                view: self.0.clone(),
+                viewport: bounds,
+            })
+            .handle_event(bounds, event, context)
+    }
+}
+struct AgendaRows {
+    view: CalendarView,
+    viewport: Rect,
+}
+impl AgendaRows {
+    fn visible_range(&self, bounds: Rect, count: usize, theme: &Theme) -> std::ops::Range<usize> {
+        let stride = theme.layout.list_row_height + theme.spacing.extra_small;
+        let start = ((self.viewport.origin.y - bounds.origin.y) / stride)
+            .floor()
+            .max(0.0) as usize;
+        let end = ((self.viewport.origin.y + self.viewport.size.height - bounds.origin.y) / stride)
+            .ceil()
+            .max(0.0) as usize;
+        start.min(count)..end.saturating_add(1).min(count)
+    }
+    fn row(bounds: Rect, index: usize, theme: &Theme) -> Rect {
+        Rect::new(
+            bounds.origin.x + theme.spacing.medium,
+            bounds.origin.y
+                + index as f32 * (theme.layout.list_row_height + theme.spacing.extra_small),
+            (bounds.size.width - theme.spacing.medium * 2.0).max(0.0),
+            theme.layout.list_row_height,
+        )
+    }
+}
+impl View for AgendaRows {
+    fn measure(&self, c: Constraints, context: &mut MeasureContext<'_>) -> Size {
+        let model = self.view.core.model.borrow();
+        let count = model
+            .store
+            .as_ref()
+            .map(|store| store.on_date(model.selected).len())
+            .unwrap_or(0);
+        c.constrain(Size::new(
+            c.maximum.width,
+            count as f32
+                * (context.theme.layout.list_row_height + context.theme.spacing.extra_small),
+        ))
+    }
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        let model = self.view.core.model.borrow();
+        let events = model
+            .store
+            .as_ref()
+            .map(|store| store.on_date(model.selected))
+            .unwrap_or(&[]);
+        for index in self.visible_range(bounds, events.len(), context.theme) {
+            let row = Self::row(bounds, index, context.theme);
+            if row.intersection(self.viewport).is_some() {
+                self.view
+                    .row_button(&events[index], index, events.len())
+                    .paint(row, context);
+            }
         }
+    }
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        let model = self.view.core.model.borrow();
+        let events = model
+            .store
+            .as_ref()
+            .map(|store| store.on_date(model.selected))
+            .unwrap_or(&[]);
+        let mut result = EventResult::Ignored;
+        for index in self.visible_range(bounds, events.len(), context.theme()) {
+            let row = Self::row(bounds, index, context.theme());
+            if row.intersection(self.viewport).is_some() {
+                result = result.merge(
+                    self.view
+                        .row_button(&events[index], index, events.len())
+                        .handle_event(row, event, context),
+                );
+            }
+        }
+        result
     }
 }
 
@@ -1257,8 +1267,25 @@ mod tests {
                 button: PointerButton::Primary,
             });
         }
+        fn click_named(&self, label: &str, role: AccessibilityRole) {
+            let theme = Theme::current();
+            let mut list = DisplayList::new();
+            let mut nodes = Vec::new();
+            let mut text = TextMeasurer::new();
+            self.view.paint(
+                Self::bounds(),
+                &mut PaintContext::new(&mut list, &theme, &theme.typography, &mut text)
+                    .with_accessibility_nodes(&mut nodes),
+            );
+            let bounds = nodes
+                .iter()
+                .find(|node| node.role == role && node.label.as_deref() == Some(label))
+                .expect("native control must be reachable")
+                .bounds;
+            self.click(bounds);
+        }
         fn new_event(&self) {
-            self.click(Frames::new(Self::bounds(), &Theme::current()).toolbar_button(3));
+            self.click_named("New Event", AccessibilityRole::Button);
         }
         fn editor_content() -> Rect {
             let b = Editor::bounds(Self::bounds());
@@ -1292,8 +1319,7 @@ mod tests {
         let events = Store::load(f.path.clone()).unwrap().events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "打ち合わせ");
-        let frames = Frames::new(Fixture::bounds(), &Theme::current());
-        f.click(frames.event_row(0, 0.0));
+        f.click_named("打ち合わせ", AccessibilityRole::ListItem);
         f.view
             .core
             .editor
@@ -1307,7 +1333,7 @@ mod tests {
             Store::load(f.path.clone()).unwrap().events[0].title,
             "Changed"
         );
-        f.click(frames.event_row(0, 0.0));
+        f.click_named("Changed", AccessibilityRole::ListItem);
         let content = Fixture::editor_content();
         f.click(Rect::new(
             content.origin.x,
@@ -1434,5 +1460,175 @@ mod tests {
             }
         }
         assert!(SvgData::decode(include_bytes!("../appicon.svg")).is_ok());
+    }
+
+    fn snapshot(
+        view: &CalendarView,
+        width: f32,
+        theme: &Theme,
+    ) -> (
+        DisplayList,
+        Vec<appcore::viewkit::accessibility::AccessibilityNode>,
+    ) {
+        let mut list = DisplayList::new();
+        let mut nodes = Vec::new();
+        let mut text = TextMeasurer::new();
+        let bounds = Rect::new(0.0, 0.0, width, 730.0);
+        view.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, theme, &theme.typography, &mut text)
+                .with_accessibility_nodes(&mut nodes),
+        );
+        (list, nodes)
+    }
+
+    #[test]
+    fn native_toolbar_and_month_pane_fit_wide_and_stacked_layouts_in_both_themes() {
+        let fixture = Fixture::new();
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for width in [320.0, 640.0, 760.0, 1100.0] {
+                let (list, nodes) = snapshot(&fixture.view, width, &theme);
+                assert!(nodes.iter().any(|n| n.role == AccessibilityRole::Toolbar));
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|n| n.label.as_deref() == Some("Previous month"))
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|n| matches!(n.label.as_deref(), Some("New Event" | "More actions")))
+                );
+                for node in nodes.iter().filter(|n| {
+                    n.role == AccessibilityRole::Button
+                        && n.bounds.origin.y < theme.layout.top_bar_height
+                }) {
+                    assert!(node.bounds.origin.x >= 0.0);
+                    assert!(node.bounds.origin.x + node.bounds.size.width <= width + 0.01);
+                }
+                let month = Frames::new(Rect::new(0.0, 0.0, width, 730.0), &theme).month;
+                let clip =
+                    list.commands()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, command)| match command {
+                            DrawCommand::PushRoundedCornersClip { rect, radii }
+                                if *rect == month =>
+                            {
+                                Some((i, *radii))
+                            }
+                            _ => None,
+                        });
+                if width >= 760.0 {
+                    let (index, radii) =
+                        clip.expect("the month/agenda chrome junction must be rounded");
+                    assert_eq!(radii, [0.0, theme.radius.extra_large, 0.0, 0.0]);
+                    let corner =
+                        Point::new(month.origin.x + month.size.width - 0.5, month.origin.y);
+                    let backdrop =
+                        list.commands()[..index]
+                            .iter()
+                            .rev()
+                            .find_map(|command| match command {
+                                DrawCommand::FillRect { rect, color } if rect.contains(corner) => {
+                                    Some(*color)
+                                }
+                                _ => None,
+                            });
+                    assert_eq!(backdrop, Some(theme.surface.sidebar_background));
+                } else {
+                    assert!(clip.is_none(), "a full-width month is not a floating card");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_agenda_scroll_keeps_rows_bounded_and_opens_the_visible_event() {
+        let fixture = Fixture::new();
+        let selected = fixture.view.core.model.borrow().selected;
+        let events = (1..=1000)
+            .map(|id| Event {
+                id,
+                date: selected,
+                title: format!("Event {id:04}"),
+                time: None,
+                location: String::new(),
+                notes: String::new(),
+            })
+            .collect();
+        fixture
+            .view
+            .core
+            .model
+            .borrow_mut()
+            .store
+            .as_mut()
+            .unwrap()
+            .save(events)
+            .unwrap();
+        let theme = Theme::LIGHT;
+        let stride = theme.layout.list_row_height + theme.spacing.extra_small;
+        fixture
+            .view
+            .core
+            .agenda_scroll
+            .set_offset(0.0, stride * 100.0);
+        let (_, nodes) = snapshot(&fixture.view, 1100.0, &theme);
+        let rows: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.role == AccessibilityRole::ListItem)
+            .collect();
+        assert!(!rows.is_empty() && rows.len() <= 12);
+        assert_eq!(rows[0].label.as_deref(), Some("Event 0101"));
+        fixture.click_named("Event 0101", AccessibilityRole::ListItem);
+        assert_eq!(
+            fixture.view.core.editor.borrow().as_ref().unwrap().id,
+            Some(101)
+        );
+        fixture.view.core.action.set(Some(Action::Cancel));
+        fixture.view.apply_action();
+        fixture
+            .view
+            .core
+            .action
+            .set(Some(Action::Select(selected.add_days(1).unwrap())));
+        fixture.view.apply_action();
+        assert_eq!(fixture.view.core.agenda_scroll.offset_y(), 0.0);
+        assert_eq!(
+            Store::load(fixture.path.clone()).unwrap().events.len(),
+            1000
+        );
+    }
+
+    #[test]
+    fn day_selection_uses_shared_active_and_inactive_selection_colors() {
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for active in [true, false] {
+                let mut list = DisplayList::new();
+                let mut text = TextMeasurer::new();
+                DayCell {
+                    date: Date::new(2026, 11, 1).unwrap(),
+                    outside: false,
+                    selected: true,
+                    today: true,
+                    titles: Vec::new(),
+                    event_count: 0,
+                }
+                .paint(
+                    Rect::new(0.0, 0.0, 80.0, 80.0),
+                    &mut PaintContext::new(&mut list, &theme, &theme.typography, &mut text)
+                        .with_window_active(active),
+                );
+                let expected = if active {
+                    theme.list.selected_background
+                } else {
+                    theme.list.inactive_selected_background
+                };
+                assert!(list.commands().iter().any(|command| matches!(command,
+                    DrawCommand::FillRoundedRect { color, .. } if *color == expected
+                )));
+            }
+        }
     }
 }
