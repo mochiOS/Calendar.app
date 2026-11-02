@@ -1,7 +1,6 @@
 use crate::date::{Date, WEEKDAYS, parse_time, time_label};
 use crate::store::{Event, Store, storage_path};
 use appcore::prelude::*;
-use appcore::viewkit::draw_command::DrawCommand;
 use appcore::viewkit::event::{EventContext, EventResult, ViewEvent};
 use appcore::viewkit::platform::Key;
 use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
@@ -781,22 +780,22 @@ struct Editor {
     start: TextFieldInteractionState,
     end: TextFieldInteractionState,
     location: TextFieldInteractionState,
-    title_field: TextField,
-    date_field: TextField,
-    start_field: TextField,
-    end_field: TextField,
-    location_field: TextField,
+    title_field: Rc<TextField>,
+    date_field: Rc<TextField>,
+    start_field: Rc<TextField>,
+    end_field: Rc<TextField>,
+    location_field: Rc<TextField>,
     all_day: State<bool>,
-    all_day_control: Checkbox,
+    all_day_control: Rc<Checkbox>,
     notes: TextEditorInteractionState,
-    notes_field: TextEditor,
-    save: Button,
-    cancel: Button,
-    delete: Button,
-    confirm: Button,
+    notes_field: Rc<TextEditor>,
+    save: Rc<Button>,
+    cancel: Rc<Button>,
+    delete: Rc<Button>,
+    confirm: Rc<Button>,
     confirm_delete: bool,
     error: Option<String>,
-    scroll: Cell<f32>,
+    scroll: ScrollState,
 }
 fn field(value: String, placeholder: &str) -> (TextFieldInteractionState, TextField) {
     let state = TextFieldInteractionState::new();
@@ -843,23 +842,24 @@ impl Editor {
             start,
             end,
             location,
-            title_field,
-            date_field,
-            start_field,
-            end_field,
-            location_field,
+            title_field: Rc::new(title_field),
+            date_field: Rc::new(date_field),
+            start_field: Rc::new(start_field),
+            end_field: Rc::new(end_field),
+            location_field: Rc::new(location_field),
             all_day,
-            all_day_control,
+            all_day_control: Rc::new(all_day_control),
             notes,
-            notes_field,
-            save: button("Save", Action::Save, action).style(ButtonStyle::Accent),
-            cancel: button("Cancel", Action::Cancel, action),
-            delete: button("Delete…", Action::Delete, action).style(ButtonStyle::Ghost),
-            confirm: button("Delete Event", Action::ConfirmDelete, action)
-                .style(ButtonStyle::Danger),
+            notes_field: Rc::new(notes_field),
+            save: Rc::new(button("Save", Action::Save, action).style(ButtonStyle::Accent)),
+            cancel: Rc::new(button("Cancel", Action::Cancel, action)),
+            delete: Rc::new(button("Delete…", Action::Delete, action).style(ButtonStyle::Ghost)),
+            confirm: Rc::new(
+                button("Delete Event", Action::ConfirmDelete, action).style(ButtonStyle::Danger),
+            ),
             confirm_delete: false,
             error: None,
-            scroll: Cell::new(0.0),
+            scroll: ScrollState::new(),
         }
     }
     fn event(&self, next_id: Result<u64, String>) -> Result<Event, String> {
@@ -925,161 +925,113 @@ impl Editor {
 }
 struct EditorContent<'a>(&'a Editor);
 impl EditorContent<'_> {
-    fn body(bounds: Rect) -> Rect {
-        Rect::new(
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            (bounds.size.height - 100.0).max(0.0),
-        )
+    fn labeled(label: &str, field: &Rc<TextField>) -> VStack {
+        VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::ExtraSmall)
+            .child(field.label(label))
+            .child(field.clone())
     }
-    fn field(bounds: Rect, y: f32) -> Rect {
-        Rect::new(
-            bounds.origin.x,
-            bounds.origin.y + y,
-            bounds.size.width,
-            28.0,
-        )
-    }
-    fn button(bounds: Rect, index: usize) -> Rect {
-        Rect::new(
-            bounds.origin.x + bounds.size.width - 84.0 - index as f32 * 92.0,
-            bounds.origin.y + bounds.size.height - 28.0,
-            84.0,
-            28.0,
-        )
+
+    fn content(&self, theme: &Theme, width: f32) -> VStack {
+        let editor = self.0;
+        let title = if editor.confirm_delete {
+            "Delete this event?"
+        } else if editor.id.is_some() {
+            "Edit Event"
+        } else {
+            "New Event"
+        };
+        let body: Box<dyn View> = if editor.confirm_delete {
+            Box::new(Text::body(format!(
+                "“{}” will be removed from your calendar.",
+                editor.title.value()
+            )))
+        } else {
+            let mut fields = VStack::new()
+                .alignment(StackAlignment::Stretch)
+                .gap(StackGap::Medium)
+                .child(Self::labeled("Title", &editor.title_field))
+                .child(Self::labeled("Date · YYYY-MM-DD", &editor.date_field))
+                .child(editor.all_day_control.clone());
+            if !editor.all_day.get() {
+                let start = Self::labeled("Starts · HH:MM", &editor.start_field);
+                let end = Self::labeled("Ends · HH:MM", &editor.end_field);
+                if width >= theme.layout.compact_form_control_width * 2.0 + theme.spacing.medium {
+                    fields = fields.child(
+                        HStack::new()
+                            .alignment(StackAlignment::Start)
+                            .gap(StackGap::Medium)
+                            .child(start.layout().flex_grow(1.0))
+                            .child(end.layout().flex_grow(1.0)),
+                    );
+                } else {
+                    fields = fields.child(start).child(end);
+                }
+            }
+            fields = fields
+                .child(Self::labeled("Location", &editor.location_field))
+                .child(
+                    VStack::new()
+                        .alignment(StackAlignment::Stretch)
+                        .gap(StackGap::ExtraSmall)
+                        .child(Text::label("Notes").tone(TextTone::Secondary))
+                        .child(
+                            editor
+                                .notes_field
+                                .clone()
+                                .height(theme.layout.control_height * 3.0),
+                        ),
+                );
+            Box::new(Form::new(fields))
+        };
+        let mut actions = HStack::new()
+            .alignment(StackAlignment::Center)
+            .gap(StackGap::Small);
+        if editor.id.is_some() && !editor.confirm_delete {
+            actions = actions.child(editor.delete.clone());
+        }
+        actions = actions
+            .child(Spacer::new())
+            .child(editor.cancel.clone())
+            .child(if editor.confirm_delete {
+                editor.confirm.clone()
+            } else {
+                editor.save.clone()
+            });
+        let mut content = VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::Medium)
+            .child(
+                Text::styled(title, TextRole::TitleSmall)
+                    .layout()
+                    .flex_shrink(0.0),
+            )
+            .child(
+                Scroll::new(editor.scroll.clone())
+                    .content(body)
+                    .layout()
+                    .flex_grow(1.0),
+            );
+        if let Some(error) = &editor.error {
+            content = content.child(
+                Text::caption(error.clone())
+                    .tone(TextTone::Destructive)
+                    .layout()
+                    .flex_shrink(0.0),
+            );
+        }
+        content.child(actions.layout().flex_shrink(0.0))
     }
 }
 impl View for EditorContent<'_> {
-    fn measure(&self, c: Constraints, _: &mut MeasureContext<'_>) -> Size {
-        c.constrain(Size::new(c.maximum.width, 564.0))
+    fn measure(&self, constraints: Constraints, context: &mut MeasureContext<'_>) -> Size {
+        self.content(context.theme, constraints.maximum.width)
+            .measure(constraints, context)
     }
     fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
-        let editor = self.0;
-        let body = Self::body(bounds);
-        let scroll = editor
-            .scroll
-            .get()
-            .clamp(0.0, (438.0 - body.size.height).max(0.0));
-        editor.scroll.set(scroll);
-        let content = Rect::new(
-            body.origin.x,
-            body.origin.y - scroll,
-            body.size.width,
-            438.0,
-        );
-        context
-            .display_list
-            .push(DrawCommand::PushClip { rect: body });
-        Text::styled(
-            if editor.confirm_delete {
-                "Delete this event?"
-            } else if editor.id.is_some() {
-                "Edit Event"
-            } else {
-                "New Event"
-            },
-            TextRole::TitleSmall,
-        )
-        .paint(Self::field(content, 0.0), context);
-        if editor.confirm_delete {
-            Text::body(format!(
-                "“{}” will be removed from your calendar.",
-                editor.title.value()
-            ))
-            .paint(Self::field(content, 48.0), context);
-        } else {
-            for (label, y) in [
-                ("Title", 40.0),
-                ("Date · YYYY-MM-DD", 100.0),
-                ("Location", 262.0),
-                ("Notes", 322.0),
-            ] {
-                Text::caption(label)
-                    .color(context.theme.colors.text_secondary)
-                    .paint(Self::field(content, y), context);
-            }
-            editor
-                .title_field
-                .paint(Self::field(content, 64.0), context);
-            editor
-                .date_field
-                .paint(Self::field(content, 124.0), context);
-            editor
-                .all_day_control
-                .paint(Self::field(content, 164.0), context);
-            let half = (content.size.width - 16.0) / 2.0;
-            for (label, x) in [("Starts · HH:MM", 0.0), ("Ends · HH:MM", half + 16.0)] {
-                Text::caption(label)
-                    .color(context.theme.colors.text_secondary)
-                    .paint(
-                        Rect::new(content.origin.x + x, content.origin.y + 204.0, half, 20.0),
-                        context,
-                    );
-            }
-            if !editor.all_day.get() {
-                editor.start_field.paint(
-                    Rect::new(content.origin.x, content.origin.y + 228.0, half, 28.0),
-                    context,
-                );
-                editor.end_field.paint(
-                    Rect::new(
-                        content.origin.x + half + 16.0,
-                        content.origin.y + 228.0,
-                        half,
-                        28.0,
-                    ),
-                    context,
-                );
-            } else {
-                Text::label("All day")
-                    .color(context.theme.colors.text_tertiary)
-                    .paint(Self::field(content, 228.0), context);
-            }
-            editor
-                .location_field
-                .paint(Self::field(content, 286.0), context);
-            editor.notes_field.paint(
-                Rect::new(
-                    content.origin.x,
-                    content.origin.y + 346.0,
-                    content.size.width,
-                    88.0,
-                ),
-                context,
-            );
-        }
-        context.display_list.push(DrawCommand::PopClip);
-        if let Some(error) = &editor.error {
-            Text::caption(error.clone())
-                .color(context.theme.colors.destructive)
-                .paint(
-                    Rect::new(
-                        bounds.origin.x,
-                        bounds.origin.y + bounds.size.height - 88.0,
-                        bounds.size.width,
-                        48.0,
-                    ),
-                    context,
-                );
-        }
-        if editor.confirm_delete {
-            editor.confirm.paint(Self::button(bounds, 0), context);
-        } else {
-            editor.save.paint(Self::button(bounds, 0), context);
-        }
-        editor.cancel.paint(Self::button(bounds, 1), context);
-        if editor.id.is_some() && !editor.confirm_delete {
-            editor.delete.paint(
-                Rect::new(
-                    bounds.origin.x,
-                    bounds.origin.y + bounds.size.height - 28.0,
-                    84.0,
-                    28.0,
-                ),
-                context,
-            );
-        }
+        self.content(context.theme, bounds.size.width)
+            .paint(bounds, context);
     }
     fn handle_event(
         &self,
@@ -1087,130 +1039,21 @@ impl View for EditorContent<'_> {
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
-        let editor = self.0;
-        let body = Self::body(bounds);
-        let scroll = editor.scroll.get();
-        let content = Rect::new(
-            body.origin.x,
-            body.origin.y - scroll,
-            body.size.width,
-            438.0,
-        );
-        if editor.confirm_delete {
-            editor
-                .confirm
-                .handle_event(Self::button(bounds, 0), event, context);
-        } else {
-            editor
-                .save
-                .handle_event(Self::button(bounds, 0), event, context);
+        let result = self
+            .content(context.theme(), bounds.size.width)
+            .handle_event(bounds, event, context);
+        if self.0.all_day.get() {
+            self.0.start.set_focused(false);
+            self.0.end.set_focused(false);
         }
-        editor
-            .cancel
-            .handle_event(Self::button(bounds, 1), event, context);
-        if editor.id.is_some() && !editor.confirm_delete {
-            editor.delete.handle_event(
-                Rect::new(
-                    bounds.origin.x,
-                    bounds.origin.y + bounds.size.height - 28.0,
-                    84.0,
-                    28.0,
-                ),
-                event,
-                context,
-            );
-        }
-        if let ViewEvent::Scroll {
-            position, delta_y, ..
-        } = event
-        {
-            if body.contains(*position) {
-                let notes = Rect::new(
-                    content.origin.x,
-                    content.origin.y + 346.0,
-                    content.size.width,
-                    88.0,
-                );
-                if notes.contains(*position) {
-                    return editor.notes_field.handle_event(notes, event, context);
-                }
-                editor.scroll.set(
-                    (scroll - *delta_y * 36.0).clamp(0.0, (438.0 - body.size.height).max(0.0)),
-                );
-                context.request_redraw_in(bounds);
-                return EventResult::Consumed;
-            }
-        }
-        if editor.confirm_delete {
-            return EventResult::Consumed;
-        }
-        // Off-body presses clear text focus without activating clipped controls.
-        if event.position().is_some_and(|p| !body.contains(p)) {
-            if matches!(event, ViewEvent::PointerPressed { .. }) {
-                for state in [
-                    &editor.title,
-                    &editor.date,
-                    &editor.start,
-                    &editor.end,
-                    &editor.location,
-                ] {
-                    state.set_focused(false);
-                }
-            }
-            return EventResult::Consumed;
-        }
-        editor
-            .title_field
-            .handle_event(Self::field(content, 64.0), event, context);
-        editor
-            .date_field
-            .handle_event(Self::field(content, 124.0), event, context);
-        editor
-            .all_day_control
-            .handle_event(Self::field(content, 164.0), event, context);
-        let half = (content.size.width - 16.0) / 2.0;
-        if editor.all_day.get() {
-            editor.start.set_focused(false);
-            editor.end.set_focused(false);
-        }
-        if !editor.all_day.get() {
-            editor.start_field.handle_event(
-                Rect::new(content.origin.x, content.origin.y + 228.0, half, 28.0),
-                event,
-                context,
-            );
-            editor.end_field.handle_event(
-                Rect::new(
-                    content.origin.x + half + 16.0,
-                    content.origin.y + 228.0,
-                    half,
-                    28.0,
-                ),
-                event,
-                context,
-            );
-        }
-        editor
-            .location_field
-            .handle_event(Self::field(content, 286.0), event, context);
-        editor.notes_field.handle_event(
-            Rect::new(
-                content.origin.x,
-                content.origin.y + 346.0,
-                content.size.width,
-                88.0,
-            ),
-            event,
-            context,
-        );
-        EventResult::Consumed
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use appcore::viewkit::draw_command::DisplayList;
+    use appcore::viewkit::draw_command::{DisplayList, DrawCommand};
     use appcore::viewkit::platform::{KeyModifiers, PointerButton};
     use appcore::viewkit::typography::TextMeasurer;
     use std::path::PathBuf;
@@ -1287,24 +1130,219 @@ mod tests {
         fn new_event(&self) {
             self.click_named("New Event", AccessibilityRole::Button);
         }
-        fn editor_content() -> Rect {
-            let b = Editor::bounds(Self::bounds());
-            let inset = Theme::current().dialog.padding;
-            Rect::new(
-                b.origin.x + inset,
-                b.origin.y + inset,
-                b.size.width - 2.0 * inset,
-                b.size.height - 2.0 * inset,
-            )
-        }
         fn save(&self) {
-            self.click(EditorContent::button(Self::editor_content(), 0));
+            self.click_named("Save", AccessibilityRole::Button);
         }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.path.parent().unwrap());
         }
+    }
+
+    fn editor_snapshot(
+        editor: &Editor,
+        bounds: Rect,
+        theme: &Theme,
+    ) -> (DisplayList, Vec<AccessibilityNode>) {
+        let mut list = DisplayList::new();
+        let mut nodes = Vec::new();
+        let mut text = TextMeasurer::new();
+        editor.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, theme, &theme.typography, &mut text)
+                .with_accessibility_nodes(&mut nodes),
+        );
+        (list, nodes)
+    }
+
+    #[test]
+    fn editor_footer_stays_reachable_while_native_form_scrolls_in_both_themes() {
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for (w, h) in [(320., 300.), (520., 400.), (1100., 730.)] {
+                let pending = Rc::new(Cell::new(None));
+                let mut editor = Editor::new(
+                    Date {
+                        year: 2026,
+                        month: 11,
+                        day: 2,
+                    },
+                    None,
+                    &pending,
+                );
+                editor.id = Some(1);
+                editor.error = Some("Use a valid date in YYYY-MM-DD format".into());
+                let bounds = Rect::new(0., 0., w, h);
+                let (list, before) = editor_snapshot(&editor, bounds, &theme);
+                let save = before
+                    .iter()
+                    .find(|n| n.label.as_deref() == Some("Save"))
+                    .unwrap()
+                    .bounds;
+                let dialog = Editor::bounds(bounds);
+                let times: Vec<_> = before
+                    .iter()
+                    .filter(|n| {
+                        n.role == AccessibilityRole::TextField
+                            && n.label.as_deref() == Some("HH:MM")
+                    })
+                    .collect();
+                assert_eq!(times.len(), 2);
+                if dialog.size.width - theme.dialog.padding * 2.0
+                    >= theme.layout.compact_form_control_width * 2.0 + theme.spacing.medium
+                {
+                    assert_eq!(times[0].bounds.origin.y, times[1].bounds.origin.y);
+                    assert!(
+                        times[0].bounds.origin.x + times[0].bounds.size.width
+                            <= times[1].bounds.origin.x
+                    );
+                } else {
+                    assert!(
+                        times[0].bounds.origin.y + times[0].bounds.size.height
+                            <= times[1].bounds.origin.y
+                    );
+                }
+                let actions: Vec<_> = before
+                    .iter()
+                    .filter(|n| n.role == AccessibilityRole::Button)
+                    .collect();
+                assert_eq!(actions.len(), 3);
+                for node in &actions {
+                    assert!(node.bounds.size.width > 0. && node.bounds.size.height > 0.);
+                    assert!(node.bounds.origin.x >= dialog.origin.x);
+                    assert!(
+                        node.bounds.origin.x + node.bounds.size.width
+                            <= dialog.origin.x + dialog.size.width + 0.1
+                    );
+                    assert!(
+                        node.bounds.origin.y + node.bounds.size.height
+                            <= dialog.origin.y + dialog.size.height
+                    );
+                }
+                for pair in actions.windows(2) {
+                    assert!(
+                        pair[0].bounds.origin.x + pair[0].bounds.size.width
+                            <= pair[1].bounds.origin.x + 0.1
+                    );
+                }
+                let body = list
+                    .commands()
+                    .iter()
+                    .find_map(|c| match c {
+                        DrawCommand::PushClip { rect }
+                            if rect.size.height > 0.
+                                && rect.origin.y > dialog.origin.y
+                                && rect.origin.y + rect.size.height <= save.origin.y =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("standard Scroll clips the form above the footer");
+                let mut text = TextMeasurer::new();
+                let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+                editor.handle_event(
+                    bounds,
+                    &ViewEvent::Scroll {
+                        position: Point::new(body.origin.x + 8., body.origin.y + 8.),
+                        delta_x: 0.,
+                        delta_y: 1000.,
+                    },
+                    &mut context,
+                );
+                if h <= 400. {
+                    assert!(editor.scroll.offset_y() > 0., "{w}x{h} must scroll");
+                }
+                let (_, after) = editor_snapshot(&editor, bounds, &theme);
+                assert_eq!(
+                    after
+                        .iter()
+                        .find(|n| n.label.as_deref() == Some("Save"))
+                        .unwrap()
+                        .bounds,
+                    save
+                );
+                let position = Point::new(
+                    save.origin.x + save.size.width / 2.,
+                    save.origin.y + save.size.height / 2.,
+                );
+                for event in [
+                    ViewEvent::PointerPressed {
+                        position,
+                        button: PointerButton::Primary,
+                    },
+                    ViewEvent::PointerReleased {
+                        position,
+                        button: PointerButton::Primary,
+                    },
+                ] {
+                    editor.handle_event(bounds, &event, &mut context);
+                }
+                assert!(pending.get() == Some(Action::Save));
+            }
+        }
+    }
+
+    #[test]
+    fn all_day_hides_time_controls_without_discarding_their_values() {
+        let pending = Rc::new(Cell::new(None));
+        let editor = Editor::new(
+            Date {
+                year: 2026,
+                month: 11,
+                day: 2,
+            },
+            None,
+            &pending,
+        );
+        let bounds = Fixture::bounds();
+        let theme = Theme::LIGHT;
+        editor.start.set_value("12:30");
+        editor.end.set_value("13:45");
+        let (_, nodes) = editor_snapshot(&editor, bounds, &theme);
+        let checkbox = nodes
+            .iter()
+            .find(|n| n.role == AccessibilityRole::Checkbox)
+            .unwrap()
+            .bounds;
+        let position = Point::new(
+            checkbox.origin.x + 8.,
+            checkbox.origin.y + checkbox.size.height / 2.,
+        );
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        for event in [
+            ViewEvent::PointerPressed {
+                position,
+                button: PointerButton::Primary,
+            },
+            ViewEvent::PointerReleased {
+                position,
+                button: PointerButton::Primary,
+            },
+        ] {
+            editor.handle_event(bounds, &event, &mut context);
+        }
+        assert!(editor.all_day.get());
+        let (_, nodes) = editor_snapshot(&editor, bounds, &theme);
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.role == AccessibilityRole::TextField
+                    && n.label.as_deref() == Some("HH:MM"))
+        );
+        assert_eq!(editor.start.value(), "12:30");
+        assert_eq!(editor.end.value(), "13:45");
+        editor.all_day.set(false);
+        let (_, nodes) = editor_snapshot(&editor, bounds, &theme);
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|n| n.role == AccessibilityRole::TextField
+                    && n.label.as_deref() == Some("HH:MM"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1334,13 +1372,7 @@ mod tests {
             "Changed"
         );
         f.click_named("Changed", AccessibilityRole::ListItem);
-        let content = Fixture::editor_content();
-        f.click(Rect::new(
-            content.origin.x,
-            content.origin.y + content.size.height - 28.0,
-            84.0,
-            28.0,
-        ));
+        f.click_named("Delete…", AccessibilityRole::Button);
         assert!(f.view.core.editor.borrow().as_ref().unwrap().confirm_delete);
         assert_eq!(Store::load(f.path.clone()).unwrap().events.len(), 1);
         f.event(ViewEvent::KeyPressed {
@@ -1352,13 +1384,8 @@ mod tests {
             f.view.core.editor.borrow().as_ref().unwrap().title.value(),
             "Changed"
         );
-        f.click(Rect::new(
-            content.origin.x,
-            content.origin.y + content.size.height - 28.0,
-            84.0,
-            28.0,
-        ));
-        f.click(EditorContent::button(content, 0));
+        f.click_named("Delete…", AccessibilityRole::Button);
+        f.click_named("Delete Event", AccessibilityRole::Button);
         assert!(Store::load(f.path.clone()).unwrap().events.is_empty());
     }
     #[test]
